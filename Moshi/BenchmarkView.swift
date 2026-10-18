@@ -39,6 +39,7 @@ final class BenchmarkController {
     private func update(_ sample: BenchmarkMetrics) { latest = sample; status = "Running" }
 
     nonisolated private func run(_ config: BenchmarkConfiguration) async throws {
+        FrameDiagnostics.detailedCodec = ProcessInfo.processInfo.arguments.contains("--profile-codec")
         GPU.set(cacheLimit: 64 * 1024 * 1024)
         GPU.clearCache()
         GPU.resetPeakMemory()
@@ -58,6 +59,9 @@ final class BenchmarkController {
         var codecValidation: [String: Double] = [:]
         if config.verifyGeneration && config.halfPrecisionCodec, let mimi {
             codecValidation = try await loader.verifyCodecPrecision(mimi)
+            if config.contiguousCodecWeights {
+                codecValidation.merge(try await loader.verifyCodecExecution(mimi)) { _, new in new }
+            }
         }
         let warmupStarted = ProcessInfo.processInfo.systemUptime
         // Compile the exact streaming shapes before opening the microphone queue.

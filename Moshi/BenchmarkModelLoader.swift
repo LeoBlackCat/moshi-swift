@@ -31,7 +31,7 @@ final class BenchmarkModelLoader {
         eval(model)
         return model
     }
-    func makeMimi(numCodebooks: Int, halfPrecision: Bool = false) async throws -> Mimi {
+    func makeMimi(numCodebooks: Int, halfPrecision: Bool = false, contiguousWeights: Bool = !ProcessInfo.processInfo.arguments.contains("--reference-codec-layout")) async throws -> Mimi {
         let cfg = MimiConfig.mimi_2024_07(numCodebooks: numCodebooks)
         let model = Mimi(cfg, bSize: 1)
 
@@ -101,11 +101,58 @@ final class BenchmarkModelLoader {
             model.inferenceDType = .float16
             model.useCompiledFeedForward(true)
         }
+        if contiguousWeights {
+            // Materialize the PyTorch-to-MLX convolution layout once. The pinned
+            // Metal convolution backend otherwise copies noncontiguous filters per call.
+            let filters = model.parameters().flattened().filter { name, _ in
+                name.hasSuffix(".conv.weight") || name.hasSuffix(".convtr.weight")
+                    || name.hasSuffix(".input_proj.weight") || name.hasSuffix(".output_proj.weight")
+            }
+            eval(filters.map { $0.1 })
+            var noncontiguousBytes = 0
+            for (_, value) in filters {
+                var expected = 1
+                for axis in value.shape.indices.reversed() {
+                    if value.dim(axis) > 1 && value.strides[axis] != expected { noncontiguousBytes += value.nbytes; break }
+                    expected *= value.dim(axis)
+                }
+            }
+            model.update(parameters: ModuleParameters.unflattened(filters.map { ($0.0, asStrided($0.1)) }))
+            eval(model)
+            print("BENCHMARK contiguous codec: materialized \(noncontiguousBytes) noncontiguous filter bytes")
+        }
         return model
     }
 
+    func verifyCodecExecution(_ candidate: Mimi) async throws -> [String: Double] {
+        let reference = try await makeMimi(numCodebooks: 8, halfPrecision: true, contiguousWeights: false)
+        eval(reference); candidate.resetState()
+        var tokenMismatches = 0, maxPCMError: Float = 0
+        for frame in 0..<64 {
+            if frame == 32 { reference.resetState(); candidate.resetState() }
+            let values: [Float] = (0..<1920).map { index in
+                let t = Double(frame * 1920 + index) / 24000
+                return Float(0.08 * sin(2 * .pi * 173 * t) + 0.03 * sin(2 * .pi * 431 * t))
+            }
+            let pcm = StreamArray(MLXArray(values).reshaped([1, 1, 1920]))
+            let refCodes = reference.encodeStep(pcm).asArray()!.asArray(Int32.self)
+            let codes = candidate.encodeStep(pcm).asArray()!.asArray(Int32.self)
+            tokenMismatches += zip(refCodes, codes).filter { $0 != $1 }.count
+            let input = StreamArray(MLXArray(refCodes).reshaped([1, 8, 1]))
+            let expected = reference.decodeStep(input).asArray()!.asArray(Float.self)
+            let actual = candidate.decodeStep(input).asArray()!.asArray(Float.self)
+            guard actual.count == 1920 && actual.allSatisfy({ $0.isFinite }) else { throw CustomError("Invalid optimized codec PCM") }
+            for (a, b) in zip(expected, actual) { maxPCMError = max(maxPCMError, abs(a - b)) }
+        }
+        candidate.resetState()
+        guard tokenMismatches == 0 && maxPCMError == 0 else { throw CustomError("Codec execution parity failed: tokens=\(tokenMismatches), PCM max=\(maxPCMError)") }
+        let result = ["executionParityFrames": 64.0, "executionTokenMismatches": Double(tokenMismatches), "executionMaxPCMError": Double(maxPCMError)]
+        print("BENCHMARK codec execution parity: \(result)")
+        return result
+    }
+
     func verifyCodecPrecision(_ candidate: Mimi) async throws -> [String: Double] {
-        let reference = try await makeMimi(numCodebooks: 8)
+        let reference = try await makeMimi(numCodebooks: 8, contiguousWeights: false)
         eval(reference); candidate.resetState()
         var squaredError = 0.0, squaredReference = 0.0
         var matches = 0, tokenCount = 0, sampleCount = 0

@@ -80,7 +80,7 @@ final class AudioInput: @unchecked Sendable {
 
 /// Fixed-capacity output ring. Missing samples are counted only after playback begins.
 final class AudioOutput: @unchecked Sendable {
-    static let prefillSamples = 9600 // Five frames: absorb the F2 160 ms transient plus one frame margin.
+    static let prefillSamples = 3840 // F4 restores F2 startup latency; compute savings supply headroom.
     private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var ring = [Float](repeating: 0, count: 24000)

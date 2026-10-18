@@ -222,8 +222,14 @@ public class PerfStats: Callbacks {
 /// include GPU execution/submission/synchronization, not isolated kernel duration.
 public enum FrameDiagnostics {
     public static var enabled = false
+    public static var detailedCodec = false
     public static var milliseconds: [String: Double] = [:]
     public static var counts: [String: Int] = [:]
+    /// Screening only: inserts eval boundaries and therefore changes scheduling.
+    public static func codecStage(_ name: String, _ body: () -> StreamArray) -> StreamArray {
+        guard enabled && detailedCodec else { return body() }
+        return measure(name) { let value = body(); value.eval(); return value }
+    }
     public static func reset() { milliseconds.removeAll(keepingCapacity: true); counts.removeAll(keepingCapacity: true) }
     public static func measure<T>(_ name: String, _ body: () -> T) -> T {
         guard enabled else { return body() }

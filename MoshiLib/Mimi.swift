@@ -108,10 +108,10 @@ public class Mimi: Module {
     }
 
     public func encodeStep(_ x: StreamArray) -> StreamArray {
-        var x = self.encoder.step(x.map { $0.asType(self.inferenceDType) })
-        x = x.map { self.encoderTransformer($0, cache: self.encoderCache)[0] }
-        x = self.downsample.step(x)
-        let codes = x.map { self.quantizer.encode($0.asType(.float32)) }
+        var x = FrameDiagnostics.codecStage("mimiEncoder") { self.encoder.step(x.map { $0.asType(self.inferenceDType) }) }
+        x = FrameDiagnostics.codecStage("mimiEncoderTransformer") { x.map { self.encoderTransformer($0, cache: self.encoderCache)[0] } }
+        x = FrameDiagnostics.codecStage("mimiDownsample") { self.downsample.step(x) }
+        let codes = FrameDiagnostics.codecStage("mimiQuantizerEncode") { x.map { self.quantizer.encode($0.asType(.float32)) } }
         return codes
     }
 
@@ -125,13 +125,15 @@ public class Mimi: Module {
     }
 
     public func decodeStep(_ codes: StreamArray) -> StreamArray {
-        var emb = codes.map { self.quantizer.decode($0).asType(self.inferenceDType) }
-        emb = self.upsample.step(emb)
-        let out = emb.map { self.decoderTransformer($0, cache: self.decoderCache)[0] }
-        return self.decoder.step(out)
+        var emb = FrameDiagnostics.codecStage("mimiQuantizerDecode") { codes.map { self.quantizer.decode($0).asType(self.inferenceDType) } }
+        emb = FrameDiagnostics.codecStage("mimiUpsample") { self.upsample.step(emb) }
+        let out = FrameDiagnostics.codecStage("mimiDecoderTransformer") { emb.map { self.decoderTransformer($0, cache: self.decoderCache)[0] } }
+        return FrameDiagnostics.codecStage("mimiDecoder") { self.decoder.step(out) }
     }
 
     public func resetState() {
+        self.downsample.resetState()
+        self.upsample.convtr.resetState()
         self.encoder.resetState()
         self.decoder.resetState()
         self.encoderCache.forEach { c in c.reset() }

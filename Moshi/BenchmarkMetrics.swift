@@ -5,6 +5,8 @@ import MLX
 struct BenchmarkConfiguration: Encodable, Sendable {
     var mode = "mimi"
     let metalOpsPerBuffer = Int(ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"] ?? "10") ?? 10
+    let contiguousCodecWeights = !ProcessInfo.processInfo.arguments.contains("--reference-codec-layout")
+    let detailedCodecProfile = ProcessInfo.processInfo.arguments.contains("--profile-codec")
     var optimizedGeneration = true
     var verifyGeneration = false
     var halfPrecisionCodec = true
@@ -65,7 +67,7 @@ struct BenchmarkMetrics: Codable, Sendable {
 
 struct BenchmarkHeader: Encodable {
     let event = "header"
-    let schemaVersion = 6
+    let schemaVersion = 7
     let runID: String
     let startedAt: Date
     let device: String
