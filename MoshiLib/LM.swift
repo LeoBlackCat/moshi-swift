@@ -59,6 +59,7 @@ class Depformer: Module {
                 // Weights are frozen before compilation. Depth KV is local to one audio frame;
                 // the only cross-call mutable state is the sampler RNG, explicitly threaded.
                 compiledSlices[bucket] = compile(inputs: [MLXRandom.globalState], outputs: [MLXRandom.globalState]) { [unowned self] (inputs: [MLXArray]) -> [MLXArray] in
+                    FrameDiagnostics.counts["depthCompileTrace", default: 0] += 1
                     let cache: [KVCache] = self.transformerCache.map { _ in DepthKVCache() }
                     return [self.sampleWithCache(mainTransformerOut: inputs[0], stepIdx: bucket,
                         sampler: sampler, textToken: inputs[1], cache: cache)]
@@ -366,19 +367,19 @@ public class LM: Module {
             let e = emb(a)
             x = x.map { $0 + e } ?? e
         }
-        let mainTransformerOut = outNorm(transformer(x!, cache: self.transformerCache))
+        let mainTransformerOut = FrameDiagnostics.measure("temporalGraph") { outNorm(transformer(x!, cache: self.transformerCache)) }
         let textLogits = textLinear(mainTransformerOut[0..., -1, 0...])
         let (textToken, _) = textSampler(logits: textLogits)
-        textToken.eval()
+        FrameDiagnostics.measure("temporalEvalWait") { textToken.eval() }
         cb.onEvent(.endStep)
         if let depformer = self.depformer {
             cb.onEvent(.beginDepformer)
-            let audioTokens = depformer.sample(
+            let audioTokens = FrameDiagnostics.measure("depthGraph") { depformer.sample(
                 mainTransformerOut: mainTransformerOut,
                 stepIdx: stepIdx,
                 sampler: audioSampler,
-                textToken: textToken)
-            audioTokens.eval()
+                textToken: textToken) }
+            FrameDiagnostics.measure("depthEvalWait") { audioTokens.eval() }
             cb.onEvent(.endDepformer)
             return (textToken, audioTokens)
         } else {

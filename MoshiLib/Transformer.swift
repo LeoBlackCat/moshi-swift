@@ -292,7 +292,8 @@ private class TransformerLayer: Module {
         if compiledFeedForwardEnabled {
             if compiledFeedForward == nil {
                 compiledFeedForward = compile { [unowned self] (input: MLXArray) -> MLXArray in
-                    self.feedForward(input)
+                    FrameDiagnostics.counts["feedForwardCompileTrace", default: 0] += 1
+                    return self.feedForward(input)
                 }
             }
             return compiledFeedForward!(x)

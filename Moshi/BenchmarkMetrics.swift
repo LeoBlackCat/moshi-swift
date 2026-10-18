@@ -65,7 +65,7 @@ struct BenchmarkMetrics: Codable, Sendable {
 
 struct BenchmarkHeader: Encodable {
     let event = "header"
-    let schemaVersion = 5
+    let schemaVersion = 6
     let runID: String
     let startedAt: Date
     let device: String
@@ -113,10 +113,10 @@ final class BenchmarkLogger {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
     }
-    func write<T: Encodable>(_ value: T) throws {
+    func write<T: Encodable>(_ value: T, synchronize: Bool = true) throws {
         var data = try encoder.encode(value); data.append(10)
         try file.write(contentsOf: data)
-        try file.synchronize()
+        if synchronize { try file.synchronize() }
     }
     deinit { try? file.close() }
 }
@@ -161,4 +161,22 @@ func physicalFootprint() -> UInt64 {
         }
     }
     return result == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0
+}
+
+/// Buffered until audio stops; no frame-level file I/O on the inference worker.
+struct FrameTrace: Encodable {
+    let event = "frame"
+    let step: Int
+    let elapsedSeconds: Double
+    let computeMs: Double
+    let workerGapMs: Double
+    let receiveWaitMs: Double
+    let timings: [String: Double]
+    let operations: [String: Int]
+    let mlxActiveBytes: Int
+    let mlxCacheBytes: Int
+    let mlxPeakBytes: Int
+    let inputQueuedMs: Double
+    let outputQueuedMs: Double
+    let underruns: Int
 }

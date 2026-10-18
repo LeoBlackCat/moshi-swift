@@ -128,6 +128,11 @@ class RotatingKVCache: KVCache, Evaluatable {
     }
 
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let diagnosticStart = ProcessInfo.processInfo.systemUptime
+        defer { if FrameDiagnostics.enabled {
+            FrameDiagnostics.milliseconds["ringUpdateGraph", default: 0] += (ProcessInfo.processInfo.systemUptime - diagnosticStart) * 1000
+            FrameDiagnostics.counts["ringUpdate", default: 0] += 1
+        } }
         let t = keys.dim(2)
         if t > self.maxSize {
             fatalError("query to update with shape \(keys.shape) larger than maxSize \(maxSize)")
@@ -155,6 +160,10 @@ class RotatingKVCache: KVCache, Evaluatable {
     }
 
     func createAttentionMask(h: MLXArray) -> MLXArray? {
+        let diagnosticStart = ProcessInfo.processInfo.systemUptime
+        defer { if FrameDiagnostics.enabled {
+            FrameDiagnostics.milliseconds["ringMaskGraph", default: 0] += (ProcessInfo.processInfo.systemUptime - diagnosticStart) * 1000
+        } }
         let t = h.dim(1)
         let finalOffset = self.offset + t
         let finalOffsetMod = finalOffset % self.maxSize

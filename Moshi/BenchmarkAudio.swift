@@ -80,6 +80,7 @@ final class AudioInput: @unchecked Sendable {
 
 /// Fixed-capacity output ring. Missing samples are counted only after playback begins.
 final class AudioOutput: @unchecked Sendable {
+    static let prefillSamples = 9600 // Five frames: absorb the F2 160 ms transient plus one frame margin.
     private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var ring = [Float](repeating: 0, count: 24000)
@@ -115,7 +116,7 @@ final class AudioOutput: @unchecked Sendable {
         guard count + values.count <= ring.count else { rejectedFrames += 1; return }
         for value in values { ring[write] = value; write = (write + 1) % ring.count }
         count += values.count
-        if count >= 3840 { started = true }
+        if count >= Self.prefillSamples { started = true }
     }
     func counters() -> (underruns: Int, missing: Int, rejected: Int, queuedMs: Double, firstRender: Double?) {
         lock.lock(); defer { lock.unlock() }

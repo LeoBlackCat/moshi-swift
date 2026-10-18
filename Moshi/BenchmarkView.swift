@@ -107,7 +107,7 @@ final class BenchmarkController {
         let batteryStart = await MainActor.run { UIDevice.current.batteryLevel }
         try logger.write(BenchmarkHeader(runID: logger.url.deletingPathExtension().lastPathComponent,
             startedAt: Date(), device: deviceIdentifier(), ios: ProcessInfo.processInfo.operatingSystemVersionString,
-            configuration: config, loadSeconds: loadSeconds, coldWarmupSeconds: coldWarmupSeconds, playbackPrefillSamples: 3840, modelFileBytes: transformer?.sourceFileBytes ?? 0,
+            configuration: config, loadSeconds: loadSeconds, coldWarmupSeconds: coldWarmupSeconds, playbackPrefillSamples: AudioOutput.prefillSamples, modelFileBytes: transformer?.sourceFileBytes ?? 0,
             modelSource: transformer?.sourceName ?? "Mimi tokenizer-dbaa9758-checkpoint125.safetensors",
             precision: transformer?.precision ?? "Mimi checkpoint native dtype", logicalParameters: transformer?.parameterCount ?? 0,
             includesDepthTransformer: transformer?.includesDepthTransformer ?? false,
@@ -129,6 +129,8 @@ final class BenchmarkController {
         var temporalTotal = 0.0, depthTotal = 0.0
         var memorySum = 0.0, memorySamples = 0
         var frameTimes: [Double] = []
+        var traces: [FrameTrace] = []; traces.reserveCapacity(config.durationSeconds * 13)
+        var previousEnd = started
         var firstCapture: Double?
         while !stopFlag.load(ordering: .relaxed) {
             let now = ProcessInfo.processInfo.systemUptime
@@ -147,12 +149,14 @@ final class BenchmarkController {
                 if firstCapture == nil { firstCapture = packet!.capturedAt }
             }
             let computeStarted = ProcessInfo.processInfo.systemUptime
+            FrameDiagnostics.enabled = true
+            FrameDiagnostics.reset()
             autoreleasepool {
                 var codes: MLXArray?
                 if let packet, let mimi {
                     let t = ProcessInfo.processInfo.systemUptime
-                    let stream = mimi.encodeStep(StreamArray(MLXArray(packet.pcm).reshaped([1, 1, 1920])))
-                    stream.eval(); codes = stream.asArray()
+                    let stream = FrameDiagnostics.measure("encodeGraph") { mimi.encodeStep(StreamArray(MLXArray(packet.pcm).reshaped([1, 1, 1920]))) }
+                    FrameDiagnostics.measure("encodeEvalWait") { stream.eval() }; codes = stream.asArray()
                     encodeTotal += (ProcessInfo.processInfo.systemUptime - t) * 1000
                 }
                 var generated: MLXArray?
@@ -178,7 +182,8 @@ final class BenchmarkController {
                 let outputCodes = transformer?.includesDepthTransformer == true ? generated : codes
                 if let codes = outputCodes, let mimi {
                     let t = ProcessInfo.processInfo.systemUptime
-                    let decoded = mimi.decodeStep(StreamArray(codes)); decoded.eval()
+                    let decoded = FrameDiagnostics.measure("decodeGraph") { mimi.decodeStep(StreamArray(codes)) }
+                    FrameDiagnostics.measure("decodeEvalWait") { decoded.eval() }
                     if let pcm = decoded.asArray() {
                         let values = pcm.asArray(Float.self)
                         sample.decodedSamples += values.count
@@ -186,18 +191,28 @@ final class BenchmarkController {
                         // Random tokens can make harsh noise; attenuate playback only, outside inference.
                         let playback = transformer?.includesDepthTransformer == true
                             ? values.map { $0.isFinite ? max(-1, min(1, $0)) * 0.1 : 0 } : values
-                        if config.mode != "throughput" { output.send(playback) }
+                        if config.mode != "throughput" { FrameDiagnostics.measure("audioSend") { output.send(playback) } }
                     }
                     decodeTotal += (ProcessInfo.processInfo.systemUptime - t) * 1000
                 }
                 sample.steps += 1; frameCount += 1
                 if let packet { sample.captureToEnqueueMs = (ProcessInfo.processInfo.systemUptime - packet.capturedAt) * 1000 }
             }
+            // Explicit trailing fence tests for work deferred beyond evaluated PCM.
+            FrameDiagnostics.measure("trailingMetalSync") { Stream.gpu.synchronize() }
             let end = ProcessInfo.processInfo.systemUptime
             let frameMs = (end - computeStarted) * 1000
             frameTimes.append(frameMs)
             sample.maxFrameComputeMs = max(sample.maxFrameComputeMs, frameMs)
             if frameMs > 80 { sample.computeDeadlineMisses += 1 }
+            let allocation = GPU.snapshot(), incomingFrame = input.counters(), outgoingFrame = output.counters()
+            traces.append(FrameTrace(step: sample.steps, elapsedSeconds: end - started, computeMs: frameMs,
+                workerGapMs: (now - previousEnd) * 1000, receiveWaitMs: (computeStarted - now) * 1000,
+                timings: FrameDiagnostics.milliseconds, operations: FrameDiagnostics.counts,
+                mlxActiveBytes: allocation.activeMemory, mlxCacheBytes: allocation.cacheMemory, mlxPeakBytes: allocation.peakMemory,
+                inputQueuedMs: incomingFrame.queuedMs, outputQueuedMs: outgoingFrame.queuedMs, underruns: outgoingFrame.underruns))
+            previousEnd = end
+            FrameDiagnostics.enabled = false
             if end - lastLog >= 1 {
                 let sortedTimes = frameTimes.sorted()
                 sample.frameComputeP50Ms = sortedTimes[sortedTimes.count / 2]
@@ -239,8 +254,19 @@ final class BenchmarkController {
                 encodeTotal = 0; decodeTotal = 0; transformerTotal = 0; frameCount = 0
             }
         }
+        let completedSeconds = ProcessInfo.processInfo.systemUptime - started
+        input.stop(); output.stop()
+        // Capture final counters, closing the F2 last-fractional-second evidence gap.
+        let finalInput = input.counters(), finalOutput = output.counters()
+        sample.elapsedSeconds = completedSeconds
+        sample.droppedInputFrames = finalInput.dropped; sample.inputQueuedMs = finalInput.queuedMs
+        sample.underrunCallbacks = finalOutput.underruns; sample.missingOutputSamples = finalOutput.missing
+        sample.rejectedOutputFrames = finalOutput.rejected; sample.outputQueuedMs = finalOutput.queuedMs
+        struct FinalCounters: Encodable { let event = "finalCounters"; let metrics: BenchmarkMetrics }
+        try logger.write(FinalCounters(metrics: sample))
+        for trace in traces { try logger.write(trace, synchronize: false) }
         struct End: Encodable { let event = "end"; let elapsedSeconds: Double; let stoppedByUser: Bool; let stopReason: String?; let totalSteps: Int; let batteryEnd: Float }
-        try logger.write(End(elapsedSeconds: ProcessInfo.processInfo.systemUptime - started,
+        try logger.write(End(elapsedSeconds: completedSeconds,
                              stoppedByUser: stopFlag.load(ordering: .relaxed), stopReason: stopCause.withLock { $0 }, totalSteps: sample.steps,
                              batteryEnd: await MainActor.run { UIDevice.current.batteryLevel }))
         await finished("Finished — export JSONL below")

@@ -2,6 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 import MLX
+import Foundation
 import os.signpost
 
 public enum EventKind {
@@ -214,5 +215,22 @@ public class PerfStats: Callbacks {
             arrays["text_tokens"] = a
         }
         try save(arrays: arrays, url: url)
+    }
+}
+
+/// Worker-only diagnostic counters. Wall times include host scheduling; eval waits
+/// include GPU execution/submission/synchronization, not isolated kernel duration.
+public enum FrameDiagnostics {
+    public static var enabled = false
+    public static var milliseconds: [String: Double] = [:]
+    public static var counts: [String: Int] = [:]
+    public static func reset() { milliseconds.removeAll(keepingCapacity: true); counts.removeAll(keepingCapacity: true) }
+    public static func measure<T>(_ name: String, _ body: () -> T) -> T {
+        guard enabled else { return body() }
+        let start = ProcessInfo.processInfo.systemUptime
+        let result = body()
+        milliseconds[name, default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1000
+        counts[name, default: 0] += 1
+        return result
     }
 }
