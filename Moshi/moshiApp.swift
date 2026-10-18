@@ -28,13 +28,24 @@ struct moshiApp: App {
     @Environment(\.scenePhase) var scenePhase
 
     init() {
+        // MLX reads this once on first Metal evaluation: configure before constructing models.
+        let args = ProcessInfo.processInfo.arguments
+        var operations = 64
+        if let index = args.firstIndex(of: "--metal-ops"), args.count > index + 1,
+           let requested = Int(args[index + 1]), [10, 32, 64, 128].contains(requested) {
+            operations = requested
+        }
+        setenv("MLX_MAX_OPS_PER_BUFFER", String(operations), 1)
         requestMicrophoneAccess()
     }
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environment(DeviceStat())
+            if ProcessInfo.processInfo.arguments.contains("--benchmark") {
+                NavigationStack { BenchmarkView() }
+            } else {
+                ContentView().environment(DeviceStat())
+            }
         }
 #if os(iOS)
         .onChange(of: scenePhase) { (phase) in

@@ -5,6 +5,7 @@
 import MLX
 import MLXFast
 import MLXNN
+import MLXRandom
 
 public struct DepformerConfig {
     var transformer: TransformerConfig
@@ -29,7 +30,10 @@ class DepformerSlice: Module {
 
 class Depformer: Module {
     let cfg: LmConfig
-    let transformerCache: [KVCache]
+    var transformerCache: [KVCache]
+    var compiledExecution = false
+    private var compiledSlices: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledSampler: Sampler?
     @ModuleInfo(key: "slices") var slices: [DepformerSlice]
 
     public init(_ cfg: LmConfig, _ cfgDepformer: DepformerConfig, bSize: Int) {
@@ -48,9 +52,27 @@ class Depformer: Module {
     public func sample(
         mainTransformerOut: MLXArray, stepIdx: Int, sampler: Sampler, textToken: MLXArray
     ) -> MLXArray {
-        for c in self.transformerCache {
-            c.reset()
+        if compiledExecution {
+            if compiledSampler !== sampler { compiledSlices.removeAll(); compiledSampler = sampler }
+            let bucket = min(stepIdx, cfg.audioDelays.max() ?? 0)
+            if compiledSlices[bucket] == nil {
+                // Weights are frozen before compilation. Depth KV is local to one audio frame;
+                // the only cross-call mutable state is the sampler RNG, explicitly threaded.
+                compiledSlices[bucket] = compile(inputs: [MLXRandom.globalState], outputs: [MLXRandom.globalState]) { [unowned self] (inputs: [MLXArray]) -> [MLXArray] in
+                    let cache: [KVCache] = self.transformerCache.map { _ in DepthKVCache() }
+                    return [self.sampleWithCache(mainTransformerOut: inputs[0], stepIdx: bucket,
+                        sampler: sampler, textToken: inputs[1], cache: cache)]
+                }
+            }
+            return compiledSlices[bucket]!([mainTransformerOut, textToken])[0]
         }
+        return sampleWithCache(mainTransformerOut: mainTransformerOut, stepIdx: stepIdx,
+            sampler: sampler, textToken: textToken, cache: transformerCache)
+    }
+
+    private func sampleWithCache(mainTransformerOut: MLXArray, stepIdx: Int, sampler: Sampler,
+                                 textToken: MLXArray, cache: [KVCache]) -> MLXArray {
+        for c in cache { c.reset() }
         var lastToken = textToken
         var tokens: [MLXArray] = []
         for (sliceIdx, slice) in slices.enumerated() {
@@ -58,7 +80,7 @@ class Depformer: Module {
                 lastToken = MLXArray([self.cfg.audioPaddingToken()])
             }
             var xs = slice.linearIn(mainTransformerOut) + slice.emb(lastToken)
-            xs = slice.transformer(xs, cache: self.transformerCache)
+            xs = slice.transformer(xs, cache: cache)
             let logits = slice.linearOut(xs)
             (lastToken, _) = sampler(logits: logits[0])
             tokens.append(lastToken)
@@ -161,6 +183,19 @@ public struct LmConfig {
             audioCodebooks: 16,
             audioDelays: audioDelays + audioDelays
         )
+    }
+
+    /// Complete dual-stream architecture sized near one billion total LM parameters.
+    /// Random initialization is performed by the benchmark runner, never loaded/trained.
+    public static func benchmarkComplete1b() -> LmConfig {
+        var cfg = moshi1b(audioDelay: 2)
+        cfg.transformer.numLayers = 14
+        cfg.textInVocabSize = 8001
+        cfg.textOutVocabSize = 8000
+        cfg.depformer!.transformer.dModel = 512
+        cfg.depformer!.transformer.numHeads = 8
+        cfg.depformer!.transformer.dimFeedForward = 2048
+        return cfg
     }
 
     public static func moshi2b(audioDelay: Int) -> LmConfig {
@@ -278,6 +313,16 @@ public class LM: Module {
         self.transformerCache = self._transformer.wrappedValue.makeCache(bSize: bSize)
     }
 
+    /// Storage/scheduling optimization only; all depth layers and attention positions remain.
+    public func useCompactDepthCache(_ enabled: Bool, compiled: Bool = false) {
+        guard let depformer else { return }
+        transformer.useCompiledFeedForward(compiled)
+        depformer.compiledExecution = compiled
+        depformer.transformerCache = enabled
+            ? depformer.transformerCache.map { _ in DepthKVCache() }
+            : depformer.slices[0].transformer.makeCache(bSize: 1)
+    }
+
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         var x = textEmb(x)
         x = transformer(x, cache: self.transformerCache)
@@ -365,11 +410,15 @@ public class LMGen {
     let mainCodebooks: Int
     let cb: Callbacks
     var stepIdx: Int
+    private let hostHistory: Bool
+    private var history: [Int32]
 
     public init(
         _ model: LM, maxSteps: Int, audioSampler: Sampler, textSampler: Sampler,
-        cb: Callbacks = EmptyCallbacks()
+        cb: Callbacks = EmptyCallbacks(), hostHistory: Bool = false
     ) {
+        self.hostHistory = hostHistory
+        self.history = hostHistory ? Array(repeating: Int32(ungeneratedToken), count: (1 + model.cfg.audioCodebooks) * maxSteps) : []
         self.model = model
         self.maxSteps = maxSteps
         self.audioSampler = audioSampler
@@ -383,6 +432,7 @@ public class LMGen {
     }
 
     public func step(otherAudioTokens: MLXArray) -> MLXArray? {
+        if hostHistory { return stepHost(otherAudioTokens: otherAudioTokens) }
         if self.stepIdx >= self.maxSteps {
             return nil
         }
@@ -436,7 +486,44 @@ public class LMGen {
         return textIds
     }
 
+    private func stepHost(otherAudioTokens: MLXArray) -> MLXArray? {
+        guard stepIdx < maxSteps else { return nil }
+        let other = otherAudioTokens.asArray(Int32.self)
+        precondition(other.count == model.cfg.audioCodebooks - mainCodebooks)
+        for (index, token) in other.enumerated() {
+            history[(1 + mainCodebooks + index) * maxSteps + stepIdx] = token
+        }
+        let text = stepIdx == 0 ? Int32(model.cfg.textOutVocabSize) : history[stepIdx - 1]
+        precondition(text != Int32(ungeneratedToken))
+        let textIds = MLXArray([text]).reshaped([1, 1])
+        let audioIds = model.cfg.audioDelays.enumerated().map { index, delay in
+            let source = stepIdx - 1 - delay
+            let token = source < 0 ? Int32(model.cfg.audioPaddingToken()) : history[(1 + index) * maxSteps + source]
+            precondition(token != Int32(ungeneratedToken))
+            return MLXArray([token]).reshaped([1, 1])
+        }
+        let (tt, at) = model.sample(textIds: textIds, audioIds: audioIds, stepIdx: stepIdx,
+            textSampler: textSampler, audioSampler: audioSampler, cb: cb)
+        history[stepIdx] = tt.item(Int32.self)
+        let audio = at.asArray(Int32.self)
+        precondition(audio.count == mainCodebooks)
+        for (index, token) in audio.enumerated() {
+            let target = stepIdx - model.cfg.audioDelays[index]
+            if target >= 0 { history[(1 + index) * maxSteps + target] = token }
+        }
+        stepIdx += 1
+        return textIds
+    }
+
     public func lastAudioTokens() -> MLXArray? {
+        if hostHistory {
+            let index = stepIdx - 1 - (model.cfg.audioDelays.max() ?? 0)
+            guard index >= 0 else { return nil }
+            let tokens = (0..<mainCodebooks).map { history[(1 + $0) * maxSteps + index] }
+            precondition(!tokens.contains(Int32(ungeneratedToken)))
+            guard !tokens.contains(Int32(model.cfg.audioPaddingToken())) else { return nil }
+            return MLXArray(tokens).reshaped([1, mainCodebooks])
+        }
         let genIdx = self.stepIdx - 1 - (self.model.cfg.audioDelays.max() ?? 0)
         if genIdx < 0 {
             return nil
@@ -454,7 +541,8 @@ public class LMGen {
     public func reset() {
         self.stepIdx = 0
         self.model.resetCache()
-        self.genSequence[0...] = MLXArray(ungeneratedToken)
+        if hostHistory { history = Array(repeating: Int32(ungeneratedToken), count: history.count) }
+        else { self.genSequence[0...] = MLXArray(ungeneratedToken) }
         cb.onReset()
     }
 }

@@ -70,6 +70,7 @@ struct ContentView: View {
                     sidebar: {
                         VStack {
                             List {
+                                NavigationLink("Speech Benchmark") { BenchmarkView() }
                                 ForEach(availableModels) { modelType in
                                     NavigationLink(
                                         modelType.rawValue,

@@ -247,6 +247,8 @@ class LayerScale: Module, UnaryLayer {
 }
 
 private class TransformerLayer: Module {
+    var compiledFeedForwardEnabled = false
+    private var compiledFeedForward: ((MLXArray) -> MLXArray)?
     @ModuleInfo(key: "gating") var gating: UnaryLayer
     @ModuleInfo(key: "norm1") var norm1: UnaryLayer
     @ModuleInfo(key: "norm2") var norm2: UnaryLayer
@@ -287,11 +289,20 @@ private class TransformerLayer: Module {
             x = layerScale1(x)
         }
         x = residual + x
-        residual = x
-        x = gating(norm2(x))
-        if let layerScale2 = self.layerScale2 {
-            x = layerScale2(x)
+        if compiledFeedForwardEnabled {
+            if compiledFeedForward == nil {
+                compiledFeedForward = compile { [unowned self] (input: MLXArray) -> MLXArray in
+                    self.feedForward(input)
+                }
+            }
+            return compiledFeedForward!(x)
         }
+        return feedForward(x)
+    }
+
+    private func feedForward(_ residual: MLXArray) -> MLXArray {
+        var x = gating(norm2(residual))
+        if let layerScale2 { x = layerScale2(x) }
         return residual + x
     }
 }
@@ -303,6 +314,10 @@ public class Transformer: Module {
     public init(_ cfg: TransformerConfig) {
         self.cfg = cfg
         self.layers = (0..<cfg.numLayers).map { _ in TransformerLayer(cfg) }
+    }
+
+    public func useCompiledFeedForward(_ enabled: Bool) {
+        for layer in layers { layer.compiledFeedForwardEnabled = enabled }
     }
 
     public func callAsFunction(_ x: MLXArray, cache: [KVCache]) -> MLXArray {

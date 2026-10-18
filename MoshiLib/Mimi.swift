@@ -51,6 +51,7 @@ public struct MimiConfig {
 }
 
 public class Mimi: Module {
+    public var inferenceDType: DType = .float32
     let cfg: MimiConfig
     let encoderCache: [KVCache]
     let decoderCache: [KVCache]
@@ -84,6 +85,11 @@ public class Mimi: Module {
         self.decoderCache = self._decoderTransformer.wrappedValue.makeCache(bSize: bSize)
     }
 
+    public func useCompiledFeedForward(_ enabled: Bool) {
+        encoderTransformer.transformer.useCompiledFeedForward(enabled)
+        decoderTransformer.transformer.useCompiledFeedForward(enabled)
+    }
+
     public func warmup() {
         let pcm = MLXArray.zeros([1, 1, 1920 * 4])
         let codes = self.encode(pcm)
@@ -94,32 +100,32 @@ public class Mimi: Module {
     public func encode(_ x: MLXArray) -> MLXArray {
         self.encoder.resetState()
         self.encoderCache.forEach { c in c.reset() }
-        var x = self.encoder(x)
+        var x = self.encoder(x.asType(inferenceDType))
         x = self.encoderTransformer(x, cache: self.encoderCache)[0]
         x = self.downsample(x)
-        let codes = self.quantizer.encode(x)
+        let codes = self.quantizer.encode(x.asType(.float32))
         return codes
     }
 
     public func encodeStep(_ x: StreamArray) -> StreamArray {
-        var x = self.encoder.step(x)
+        var x = self.encoder.step(x.map { $0.asType(self.inferenceDType) })
         x = x.map { self.encoderTransformer($0, cache: self.encoderCache)[0] }
         x = self.downsample.step(x)
-        let codes = x.map(self.quantizer.encode)
+        let codes = x.map { self.quantizer.encode($0.asType(.float32)) }
         return codes
     }
 
     public func decode(_ codes: MLXArray) -> MLXArray {
         self.decoder.resetState()
         self.decoderCache.forEach { c in c.reset() }
-        let emb = self.quantizer.decode(codes)
+        let emb = self.quantizer.decode(codes).asType(inferenceDType)
         let embUp = self.upsample(emb)
         let outs = self.decoderTransformer(embUp, cache: self.decoderCache)
         return self.decoder(outs[0])
     }
 
     public func decodeStep(_ codes: StreamArray) -> StreamArray {
-        var emb = codes.map { self.quantizer.decode($0) }
+        var emb = codes.map { self.quantizer.decode($0).asType(self.inferenceDType) }
         emb = self.upsample.step(emb)
         let out = emb.map { self.decoderTransformer($0, cache: self.decoderCache)[0] }
         return self.decoder.step(out)

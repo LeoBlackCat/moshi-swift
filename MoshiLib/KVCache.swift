@@ -174,3 +174,23 @@ class RotatingKVCache: KVCache, Evaluatable {
         return res
     }
 }
+
+/// Depth attention only has eight positions and resets every audio frame.
+/// Avoid allocating, zeroing, and scattering into 256-position temporal buffers.
+final class DepthKVCache: KVCache {
+    private var keys: MLXArray?
+    private var values: MLXArray?
+    private(set) var offset = 0
+    func reset() { keys = nil; values = nil; offset = 0 }
+    func innerState() -> [MLXArray] { [keys, values].compactMap { $0 } }
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        self.keys = self.keys.map { concatenated([$0, keys], axis: 2) } ?? keys
+        self.values = self.values.map { concatenated([$0, values], axis: 2) } ?? values
+        offset += keys.dim(2)
+        precondition(offset <= 8, "Depth cache is only for eight codebook positions")
+        return (self.keys!, self.values!)
+    }
+    func createAttentionMask(h: MLXArray) -> MLXArray? {
+        h.dim(1) > 1 ? createAdditiveCausalMask(n: h.dim(1), offset: offset).asType(h.dtype) : nil
+    }
+}
