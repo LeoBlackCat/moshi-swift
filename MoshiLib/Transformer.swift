@@ -329,9 +329,9 @@ public class Transformer: Module {
         return x
     }
 
-    public func makeCache(bSize: Int) -> [KVCache] {
+    public func makeCache(bSize: Int, dtype cacheDType: DType? = nil) -> [KVCache] {
         let kvHeads = cfg.numHeads / cfg.kvRepeat
-        let dtype = self.layers.first!.selfAttn.inProj.weight.dtype
+        let dtype = cacheDType ?? self.layers.first!.selfAttn.inProj.weight.dtype
         let cache = (0..<cfg.numLayers).map { _ in
             let cache: KVCache
             if cfg.useRotatingKVCache {

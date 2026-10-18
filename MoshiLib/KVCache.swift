@@ -194,3 +194,42 @@ final class DepthKVCache: KVCache {
         h.dim(1) > 1 ? createAdditiveCausalMask(n: h.dim(1), offset: offset).asType(h.dtype) : nil
     }
 }
+
+/// Benchmark preflight for the existing single-token rotating-cache path.
+/// Compare physical slots and visibility to a chronological sliding-window oracle.
+public func verifyRotatingCache(window: Int) -> Bool {
+    let cache = RotatingKVCache(bSize: 1, numHeads: 1, maxSize: window, headDim: 2, dtype: .float16)
+    let query = MLXArray.zeros([1, 1, 2], dtype: .float16)
+    let checkpoints: Set<Int> = [0, 1, window - 2, window - 1, window, window + 1, 2 * window - 1, 2 * window, 2 * window + 4]
+    for pass in 0..<2 {
+        cache.reset()
+        for position in 0..<(2 * window + 5) {
+            guard cache.offset == position else { return false }
+            let mask = cache.createAttentionMask(h: query)!
+            let tag = Float((position + pass * 13) % 257)
+            let key = MLXArray([tag, -tag]).asType(.float16).reshaped([1, 1, 1, 2])
+            let (keys, values) = cache.update(keys: key, values: -key)
+            eval(keys, values)
+            guard cache.offset == position + 1, keys.dim(2) == window else { return false }
+            if checkpoints.contains(position) {
+                let k = keys.asArray(Float.self), v = values.asArray(Float.self)
+                let m = mask.asArray(Float.self)
+                var visible = Set<Int>()
+                for slot in 0..<window {
+                    let newest = position - ((position - slot) % window + window) % window
+                    if newest < 0 {
+                        guard m[slot] < -1000 else { return false }
+                    } else {
+                        guard m[slot] == 0 else { return false }
+                        let expected = Float((newest + pass * 13) % 257)
+                        guard k[2 * slot] == expected, k[2 * slot + 1] == -expected,
+                              v[2 * slot] == -expected, v[2 * slot + 1] == expected else { return false }
+                        visible.insert(newest)
+                    }
+                }
+                guard visible == Set(max(0, position - window + 1)...position) else { return false }
+            }
+        }
+    }
+    return true
+}

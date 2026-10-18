@@ -10,6 +10,7 @@ struct BenchmarkConfiguration: Encodable, Sendable {
     var halfPrecisionCodec = true
     var halfPrecisionActivations = true
     var durationSeconds = 60
+    var temporalWindow: Int? = nil
     var contextSteps = 375
     var modelSelection = "main-q4"
     let modelRepository = "lmz/moshi-swift"
@@ -96,7 +97,7 @@ struct BenchmarkHeader: Encodable {
     let startingBatteryState: String
     let unavailableMetrics = ["GPU utilization: use Metal System Trace", "power watts: unavailable via public API", "acoustic microphone-to-speaker latency: requires external loopback", "exact disjoint memory attribution", "game memory allowance: requires co-resident game test"]
     let latencyDefinition = "captureToEnqueueMs uses tap arrival minus buffer duration, not acoustic timestamp; firstCaptureToRenderMs ends at source render callback, before hardware output latency"
-    let contextPolicy = "reset at contextSteps; growth sweep, not constant full-context throughput"
+    let contextPolicy = "temporalWindow if set: bounded sliding frames including current, absolute RoPE; reset only at contextSteps"
 }
 
 final class BenchmarkLogger {

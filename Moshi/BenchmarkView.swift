@@ -47,7 +47,7 @@ final class BenchmarkController {
         let loadStart = ProcessInfo.processInfo.systemUptime
         var transformer: TransformerRunner?
         if config.mode != "mimi" {
-            transformer = try await TransformerRunner(selection: config.modelSelection, contextLimit: config.contextSteps, loader: loader, optimizedGeneration: config.optimizedGeneration, halfPrecisionActivations: config.halfPrecisionActivations)
+            transformer = try await TransformerRunner(selection: config.modelSelection, contextLimit: config.contextSteps, loader: loader, optimizedGeneration: config.optimizedGeneration, halfPrecisionActivations: config.halfPrecisionActivations, temporalWindow: config.temporalWindow)
         }
         let afterModel = residentMemory()
         var mimi: Mimi?
@@ -86,6 +86,9 @@ final class BenchmarkController {
         let startingBattery = await MainActor.run { (UIDevice.current.batteryLevel, UIDevice.current.batteryState.rawValue) }
         let startingBatteryState = [0: "unknown", 1: "unplugged", 2: "charging", 3: "full"][startingBattery.1] ?? "unknown"
         print("BENCHMARK preflight: thermal=\(startingThermalState) battery=\(startingBatteryState)")
+        if config.temporalWindow != nil && ProcessInfo.processInfo.arguments.contains("--acceptance") && startingThermalState != "nominal" {
+            throw CustomError("Bounded-window acceptance requires nominal thermal start")
+        }
         if ProcessInfo.processInfo.arguments.contains("--acceptance") {
             guard startingBatteryState == "unplugged",
                   startingThermalState == "nominal" || startingThermalState == "fair" else {
@@ -261,7 +264,8 @@ struct BenchmarkView: View {
                     Text("1B main Q4 (from Q8)").tag("main-q4")
                     Text("1B main Q6").tag("main-q6")
                     Text("1B main Q8").tag("main-q8")
-                    Text("1B + depth transformer Q6").tag("speech-q6")
+                    Text("Hibiki-M + depth Q6").tag("speech-q6")
+                    Text("Hibiki-M + depth Q4 (from Q6)").tag("speech-q4")
                     Text("Synthetic ~0.5B main Q4").tag("synthetic-7")
                     Text("Synthetic ~0.8B main Q4").tag("synthetic-12")
                     Text("Synthetic ~1.3B main Q4").tag("synthetic-22")
@@ -301,6 +305,9 @@ struct BenchmarkView: View {
                 if args.count > index + 2, let seconds = Int(args[index + 2]) { controller.configuration.durationSeconds = seconds }
                 if args.count > index + 3 { controller.configuration.modelSelection = args[index + 3] }
                 if args.count > index + 4, let steps = Int(args[index + 4]) { controller.configuration.contextSteps = steps }
+                if let windowIndex = args.firstIndex(of: "--temporal-window"), args.count > windowIndex + 1 {
+                    controller.configuration.temporalWindow = Int(args[windowIndex + 1])
+                }
                 controller.configuration.optimizedGeneration = !args.contains("--reference-generation")
                 controller.configuration.verifyGeneration = args.contains("--verify-generation")
                 controller.configuration.halfPrecisionCodec = !args.contains("--fp32-codec")

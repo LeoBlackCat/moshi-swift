@@ -313,6 +313,12 @@ public class LM: Module {
         self.transformerCache = self._transformer.wrappedValue.makeCache(bSize: bSize)
     }
 
+    /// Rebuild empty temporal caches after loading/casting weights, before any generation.
+    public func rebuildTemporalCache(dtype: DType) {
+        precondition(transformerCache.allSatisfy { $0.offset == 0 })
+        transformerCache = transformer.makeCache(bSize: 1, dtype: dtype)
+    }
+
     /// Storage/scheduling optimization only; all depth layers and attention positions remain.
     public func useCompactDepthCache(_ enabled: Bool, compiled: Bool = false) {
         guard let depformer else { return }

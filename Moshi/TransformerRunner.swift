@@ -24,11 +24,16 @@ final class TransformerRunner {
     private var position = 0
     private let contextLimit: Int
 
-    init(selection: String, contextLimit: Int, loader: BenchmarkModelLoader, optimizedGeneration: Bool = true, halfPrecisionActivations: Bool = true) async throws {
+    init(selection: String, contextLimit: Int, loader: BenchmarkModelLoader, optimizedGeneration: Bool = true, halfPrecisionActivations: Bool = true, temporalWindow: Int? = nil) async throws {
         self.optimizedGeneration = optimizedGeneration
         self.contextLimit = contextLimit
-        var cfg = selection == "complete-random-q4" ? LmConfig.benchmarkComplete1b() : selection == "speech-q6" ? LmConfig.moshi1b(audioDelay: 2) : LmConfig.asr1b()
-        includesDepthTransformer = selection == "speech-q6" || selection == "complete-random-q4"
+        var cfg = selection == "complete-random-q4" ? LmConfig.benchmarkComplete1b() : (selection == "speech-q6" || selection == "speech-q4") ? LmConfig.moshi1b(audioDelay: 2) : LmConfig.asr1b()
+        includesDepthTransformer = (selection == "speech-q6" || selection == "speech-q4") || selection == "complete-random-q4"
+        if let temporalWindow {
+            guard includesDepthTransformer, temporalWindow == 1500 else { throw CustomError("Unsupported bounded temporal window") }
+            cfg.transformer.context = temporalWindow
+            cfg.transformer.useRotatingKVCache = true
+        }
         // Explicitly synthetic main-transformer scaling; not trained conversational models.
         if selection.hasPrefix("synthetic-") || selection == "complete-random-q4" {
             let layers = Int(selection.split(separator: "-").last!) ?? 8
@@ -48,7 +53,7 @@ final class TransformerRunner {
             precision = "Q4 group64 (synthetic)"
             Self.quantizeIncrementally(model, bits: 4)
         } else {
-            let filename = selection == "speech-q6" ? "moshi-37c6cfd6@200.q6.safetensors" :
+            let filename = (selection == "speech-q6" || selection == "speech-q4") ? "moshi-37c6cfd6@200.q6.safetensors" :
                 selection == "main-q6" ? "moshi-70f8f0ea@500.q6.safetensors" : "moshi-70f8f0ea@500.q8.safetensors"
             let url = try await loader.downloadFromHub(id: "lmz/moshi-swift", filename: filename)
             sourceFileBytes = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
@@ -56,9 +61,15 @@ final class TransformerRunner {
             model = try loader.makeMoshi(url, cfg)
             // Count logical weights, not packed uint32 storage or quantization metadata.
             parameterCount = Self.logicalParameterCount(model)
-            if selection == "main-q4" {
-                precision = "Q4 group64 (requantized from Q8)"
+            if selection == "main-q4" || selection == "speech-q4" {
+                precision = selection == "speech-q4" ? "Q4 group64 (requantized from Q6)" : "Q4 group64 (requantized from Q8)"
+                let originalMapping = Self.logicalParameterMapping(model)
                 Self.quantizeIncrementally(model, bits: 4)
+                guard Self.logicalParameterMapping(model) == originalMapping,
+                      Self.logicalParameterCount(model) == parameterCount else {
+                    throw CustomError("Requantization changed parameter mapping")
+                }
+                print("BENCHMARK mapping: PASS: all leaf paths and logical shapes preserved, \(parameterCount) parameters")
             } else { precision = selection.hasSuffix("q6") ? "Q6 group64" : "Q8 group64" }
         }
         if halfPrecisionActivations {
@@ -69,6 +80,9 @@ final class TransformerRunner {
             }))
         }
         eval(model)
+        if temporalWindow != nil {
+            model.rebuildTemporalCache(dtype: halfPrecisionActivations ? .float16 : .bfloat16)
+        }
         model.useCompactDepthCache(optimizedGeneration, compiled: optimizedGeneration)
         generator = includesDepthTransformer ? LMGen(model, maxSteps: contextLimit + 1, audioSampler: sampler, textSampler: sampler, cb: timing, hostHistory: optimizedGeneration) : nil
     }
@@ -76,6 +90,10 @@ final class TransformerRunner {
     /// Exercise the real quantized model, identical input and RNG seeds, through delay/reset boundaries.
     /// Fail before benchmarking if optimized token routing or cache changes alter sampled tokens.
     func verifyGenerationParity() throws {
+        if model.cfg.transformer.useRotatingKVCache {
+            guard verifyRotatingCache(window: model.cfg.transformer.context) else { throw CustomError("Sliding cache boundary verification failed") }
+            print("BENCHMARK sliding cache: PASS: 1500 slots, two wraps, absolute offsets, causal visibility and reset reuse")
+        }
         guard includesDepthTransformer else { throw CustomError("Parity check requires a complete model") }
         func trace(optimized: Bool) -> [[Int32]] {
             model.useCompactDepthCache(optimized, compiled: optimized)
@@ -103,6 +121,21 @@ final class TransformerRunner {
         }
         generationValidation = "PASS: 64 seeded stochastic steps, text + all 8 audio codebooks, including reset and delay boundaries"
         print("BENCHMARK parity: \(generationValidation)")
+    }
+
+    private static func logicalParameterMapping(_ model: Module) -> [String: [Int]] {
+        var result: [String: [Int]] = [:]
+        for (path, layer) in model.leafModules().flattened() {
+            if let q = layer as? QuantizedLinear {
+                result[path + ".weight"] = [q.weight.dim(0), q.weight.dim(1) * 32 / q.bits]
+                if let bias = q.bias { result[path + ".bias"] = bias.shape }
+            } else if let q = layer as? QuantizedEmbedding {
+                result[path + ".weight"] = [q.weight.dim(0), q.weight.dim(1) * 32 / q.bits]
+            } else {
+                for (name, tensor) in layer.parameters().flattened() { result[path + "." + name] = tensor.shape }
+            }
+        }
+        return result
     }
 
     private static func logicalParameterCount(_ model: Module) -> Int {
